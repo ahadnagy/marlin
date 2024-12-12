@@ -53,6 +53,57 @@ def gen_quant4(m, n, groupsize=-1):
     s = layer.s
     return ref, q, s
 
+
+def gen_quant4_identity(n, groupsize=-1):
+    tile = 16
+    maxq = 2 ** 4 - 1
+    w = torch.eye(n, dtype=torch.half, device=DEV)
+    if groupsize != -1:
+        w = w.reshape((-1, groupsize, n))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((groupsize, -1))
+    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+    s *= 2 / maxq
+    w = torch.round(w / s).int()
+    w += (maxq + 1) // 2
+    w = torch.clamp(w, 0, maxq)
+    ref = (w - (maxq + 1) // 2).half() * s
+    if groupsize != -1:
+        def reshape(w):
+            w = w.reshape((groupsize, -1, n))
+            w = w.permute(1, 0, 2)
+            w = w.reshape((n, n)).contiguous()
+            return w
+        ref = reshape(ref)
+        w = reshape(w)
+    s = s.reshape((-1, n)).contiguous()
+    linear = nn.Linear(n, n)
+    linear.weight.data = ref.t()
+    # Workaround to test some special cases that are forbidden by the API
+    layer = marlin.Layer(256, 256, groupsize=groupsize)
+    if groupsize == -1:
+        groupsize = n
+    layer.k = n
+    layer.n = n
+    layer.groupsize = groupsize
+    layer.B = torch.empty((n // 16, n * 16 // 8), dtype=torch.int, device=DEV)
+    layer.s = torch.empty((n // groupsize, n), dtype=torch.half, device=DEV)
+    layer.pack(linear, s.t())
+    q = layer.B
+    s = layer.s
+    return ref, q, s
+
+def compare_tensors(tensor1, tensor2):
+    if tensor1.shape != tensor2.shape:
+        raise ValueError("Tensors must have the same shape for comparison.")
+
+    # Find indices where the tensors differ
+    diff_indices = torch.nonzero(tensor1 != tensor2, as_tuple=False)
+    if diff_indices.numel() == 0:
+        return []
+    else:
+        return diff_indices.tolist()
+
 class Test(unittest.TestCase):
 
     def run_problem(self, m, n, k, thread_k, thread_n, groupsize=-1):
@@ -115,7 +166,7 @@ class Test(unittest.TestCase):
         }
         for _, layers in MODELS.items():
             for layer in layers:
-                for thread_k, thread_n in [(128, 128)]:
+                for thread_k, thread_n in [(-1, -1)]:
                     for batch in [1, 16]:
                         self.run_problem(batch, layer[1], layer[0], thread_k, thread_n)
 
@@ -148,11 +199,31 @@ class Test(unittest.TestCase):
 
     def test_groups(self):
         print()
-        for m in [16]:
+        for m in [64]:
             for groupsize in [128]:
-                for n, k in [(256, 512), (256, 1024), (256 * 128, 1024)]:
-                    for thread_shape in [(128, 128), (64, 256)]:
+                for n, k in [(256, 1024), (512, 2048), (512 * 128, 2048)]:
+                    for thread_shape in [(-1, -1), (-1, -1)]:
                         self.run_problem(m, n, k, *thread_shape, groupsize)
+
+    def test_race_condition_failure(self):
+        dtype = torch.float16
+        group_size = 128
+        n = 16384
+        k = 64
+
+        A = torch.ones((k, n), dtype=dtype, device=torch.device("cuda"))
+        _, B, s = gen_quant4_identity(n, groupsize=group_size)
+        C1 = torch.zeros((k, n), dtype=torch.half, device=DEV)
+        C2 = torch.zeros((k, n), dtype=torch.half, device=DEV)
+        workspace = torch.zeros(n // 128 * 16, device=DEV)
+        marlin.mul(A, B, C1, s, workspace, -1, -1, -1)
+        torch.cuda.synchronize()
+        marlin.mul(A, B, C2, s, workspace, -1, -1, -1)
+        torch.cuda.synchronize()
+        diff = C1 - C2
+        print(f"Differing indices: {len(compare_tensors(C1, C2))}")
+        np.savetxt('diff.out', diff.cpu().numpy(), fmt="%f", delimiter=',')
+        assert torch.allclose(C1, C2, atol=1e-2), "Output matrices match"
 
 
 if __name__ == '__main__':
