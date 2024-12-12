@@ -1,5 +1,6 @@
 import unittest
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -208,8 +209,9 @@ class Test(unittest.TestCase):
     def test_race_condition_failure(self):
         dtype = torch.float16
         group_size = 128
-        n = 16384
-        k = 64
+        n = 32768
+        #n = 256
+        k = 32
 
         A = torch.ones((k, n), dtype=dtype, device=torch.device("cuda"))
         _, B, s = gen_quant4_identity(n, groupsize=group_size)
@@ -224,6 +226,58 @@ class Test(unittest.TestCase):
         print(f"Differing indices: {len(compare_tensors(C1, C2))}")
         np.savetxt('diff.out', diff.cpu().numpy(), fmt="%f", delimiter=',')
         assert torch.allclose(C1, C2, atol=1e-2), "Output matrices match"
+
+
+    def testfunc(self, k, n):
+        dtype = torch.float16
+        group_size = 128
+
+        A = torch.ones((k, n), dtype=dtype, device=torch.device("cuda"))
+        _, B, s = gen_quant4_identity(n, groupsize=group_size)
+        C1 = torch.zeros((k, n), dtype=torch.half, device=DEV)
+        C2 = torch.zeros((k, n), dtype=torch.half, device=DEV)
+        workspace = torch.zeros(n // 128 * 16, device=DEV)
+        marlin.mul(A, B, C1, s, workspace, -1, -1, -1)
+        torch.cuda.synchronize()
+        marlin.mul(A, B, C2, s, workspace, -1, -1, -1)
+        torch.cuda.synchronize()
+        diff = C1 - C2
+        return len(compare_tensors(C1, C2)) == 0
+
+    def test_parameter_space(self):
+        # Generate logarithmic points in base 2 for k and n
+        k_values = [2 ** i for i in range(5, 8)]  # 2^5 (32) to 2^14 (16384)
+        n_values = [2 ** i for i in range(8, 16)]
+
+        # Containers for successes and failures
+        successes = []
+        failures = []
+
+        # Test the function on the 2D plane
+        for k in k_values:
+            for n in n_values:
+                if self.testfunc(k, n):
+                    successes.append((k, n))
+                else:
+                    failures.append((k, n))
+
+        # Separate successes and failures into x and y coordinates for plotting
+        successes_x, successes_y = zip(*successes) if successes else ([], [])
+        failures_x, failures_y = zip(*failures) if failures else ([], [])
+
+        # Plot the results
+        plt.figure(figsize=(10, 6))
+        plt.scatter(successes_x, successes_y, color='green', label='Success', alpha=0.7)
+        plt.scatter(failures_x, failures_y, color='red', label='Failure', alpha=0.7)
+        plt.xscale('log', base=2)
+        plt.yscale('log', base=2)
+        plt.xlabel('k values (log)')
+        plt.ylabel('n values (log)')
+        plt.title('Kernel success/failure for different k, n sizes')
+        plt.legend()
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.savefig("plot.png")
+
 
 
 if __name__ == '__main__':
